@@ -13,14 +13,19 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from caption_english.audio import AudioCapture, CaptureError, CaptureSource
+from caption_english.captions import format_captions
 from caption_english.config import (
+    MAX_FONT_SIZE,
     MAX_HEIGHT,
     MAX_WIDTH,
+    MIN_FONT_SIZE,
     MIN_HEIGHT,
     MIN_WIDTH,
     AppConfig,
+    clamp_font_size,
     clamp_size,
     load_config,
+    model_choices,
     save_config,
 )
 from caption_english.overlay import CaptionOverlay
@@ -69,6 +74,17 @@ class ControlWindow(Gtk.ApplicationWindow):
         src_row.append(self.source_combo)
         root.append(src_row)
 
+        # Speech model: accuracy vs speed
+        model_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        model_row.append(Gtk.Label(label="Speech model:", xalign=0.0))
+        choices = model_choices(app.config.model_size)
+        self._models = [name for name, _label in choices]
+        self.model_combo = Gtk.DropDown.new_from_strings([label for _name, label in choices])
+        self.model_combo.set_selected(self._models.index(app.config.model_size))
+        self.model_combo.connect("notify::selected", self._on_model_changed)
+        model_row.append(self.model_combo)
+        root.append(model_row)
+
         # Size controls
         size_frame = Gtk.Frame(label="Overlay size")
         size_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -116,6 +132,34 @@ class ControlWindow(Gtk.ApplicationWindow):
         size_box.append(presets)
         root.append(size_frame)
 
+        # Caption text controls
+        text_frame = Gtk.Frame(label="Caption text")
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        text_box.set_margin_top(8)
+        text_box.set_margin_bottom(8)
+        text_box.set_margin_start(8)
+        text_box.set_margin_end(8)
+        text_frame.set_child(text_box)
+
+        font_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        font_row.append(Gtk.Label(label="Font size", xalign=0.0, width_chars=8))
+        self.font_adj = Gtk.Adjustment(
+            value=app.config.font_size,
+            lower=MIN_FONT_SIZE,
+            upper=MAX_FONT_SIZE,
+            step_increment=2,
+            page_increment=8,
+        )
+        self.font_spin = Gtk.SpinButton(adjustment=self.font_adj, climb_rate=1, digits=0)
+        self.font_spin.set_hexpand(True)
+        self.font_spin.connect(
+            "value-changed", lambda spin: app.apply_font_size(int(spin.get_value()))
+        )
+        font_row.append(self.font_spin)
+        font_row.append(Gtk.Label(label="px"))
+        text_box.append(font_row)
+        root.append(text_frame)
+
         # Actions
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_btn = Gtk.Button(label="Start")
@@ -134,7 +178,7 @@ class ControlWindow(Gtk.ApplicationWindow):
         root.append(actions)
 
         hint = Gtk.Label(
-            label="First start downloads the Whisper model (local, English).",
+            label="The first start with each speech model downloads it (local, English).",
             wrap=True,
             xalign=0.0,
         )
@@ -162,6 +206,11 @@ class ControlWindow(Gtk.ApplicationWindow):
         if 0 <= selected < len(sources):
             self.app_ref.set_audio_source(sources[selected])
 
+    def _on_model_changed(self, *_args) -> None:  # noqa: ANN001
+        selected = self.model_combo.get_selected()
+        if 0 <= selected < len(self._models):
+            self.app_ref.set_model(self._models[selected])
+
     def set_status(self, text: str, error: bool = False) -> None:
         def _set() -> bool:
             self.status.set_text(text)
@@ -178,6 +227,7 @@ class ControlWindow(Gtk.ApplicationWindow):
             self.start_btn.set_sensitive(not running)
             self.stop_btn.set_sensitive(running)
             self.source_combo.set_sensitive(not running)
+            self.model_combo.set_sensitive(not running)
             return False
 
         GLib.idle_add(_set)
@@ -225,6 +275,7 @@ class CaptionEnglishApp(Gtk.Application):
                 width=self.config.overlay_width,
                 height=self.config.overlay_height,
                 on_size_changed=self._on_overlay_resized,
+                font_size=self.config.font_size,
             )
             self.overlay.connect("close-request", self._on_overlay_close)
             if self.config.overlay_visible:
@@ -232,14 +283,17 @@ class CaptionEnglishApp(Gtk.Application):
             else:
                 self.overlay.hide_overlay()
             self.control.set_overlay_button_label(self.overlay.is_overlay_visible())
-            # Warm the model cache so Start is quick (only if already downloaded)
-            threading.Thread(
-                target=preload_model,
-                args=(self.config.model_size,),
-                name="model-preload",
-                daemon=True,
-            ).start()
+            self._preload_model()
         self.control.present()
+
+    def _preload_model(self) -> None:
+        # Warm the model cache so Start is quick (only if already downloaded)
+        threading.Thread(
+            target=preload_model,
+            args=(self.config.model_size,),
+            name="model-preload",
+            daemon=True,
+        ).start()
 
     def _on_control_close(self, *_args) -> bool:  # noqa: ANN001
         self.stop_captioning()
@@ -262,12 +316,29 @@ class CaptionEnglishApp(Gtk.Application):
             self.config.audio_source = source  # type: ignore[assignment]
             self._persist_config()
 
+    def set_model(self, model: str) -> None:
+        """Choose the speech model; it is used from the next Start."""
+        if not model or model == self.config.model_size:
+            return
+        self.config.model_size = model
+        self._persist_config()
+        self._preload_model()
+
     def apply_overlay_size(self, width: int, height: int) -> None:
         w, h = clamp_size(width, height)
         self.config.overlay_width = w
         self.config.overlay_height = h
         if self.overlay:
             self.overlay.set_size_px(w, h)
+        self._persist_config()
+
+    def apply_font_size(self, px: int) -> None:
+        px = clamp_font_size(px)
+        if px == self.config.font_size:
+            return
+        self.config.font_size = px
+        if self.overlay:
+            self.overlay.set_font_size(px)
         self._persist_config()
 
     def _on_overlay_resized(self, width: int, height: int) -> None:
@@ -395,7 +466,7 @@ class CaptionEnglishApp(Gtk.Application):
         else:
             self._partial = text
         if self.overlay:
-            self.overlay.set_caption_text(" ".join([*self._finals, self._partial]).strip())
+            self.overlay.set_caption_text(format_captions([*self._finals, self._partial]))
         return False
 
     def _on_status(self, session: int, message: str) -> None:

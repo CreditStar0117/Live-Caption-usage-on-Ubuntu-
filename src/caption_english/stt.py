@@ -20,11 +20,19 @@ ErrorCallback = Callable[[str], None]
 StatusCallback = Callable[[str], None]
 
 # Re-decode the current phrase after this much new audio (partial results)
-STEP_SECONDS = 1.0
+STEP_SECONDS = 0.5
 # A phrase is final once this much silence follows its last word...
 END_SILENCE_SECONDS = 0.5
-# ...or once it grows this long (bounds latency and CPU per decode)
-MAX_PHRASE_SECONDS = 12.0
+# ...its finished segments are final once it grows this long...
+SOFT_COMMIT_SECONDS = 5.0
+# ...and all of it once it grows this long (bounds latency and CPU per decode)
+MAX_PHRASE_SECONDS = 10.0
+# A cut while still talking moves into a VAD pause this close to the segment start
+SNAP_SECONDS = 0.6
+# The last decode is reused when the end of speech moved less than this...
+REUSE_SPEECH_END_SECONDS = 0.15
+# ...and that decode saw this much audio past it (so it did not miss the last word)
+REUSE_TAIL_SECONDS = 0.3
 # Audio kept while idle so the first word of the next phrase is not clipped
 PREROLL_SECONDS = 0.3
 # RMS below this is treated as silence and never sent to the model
@@ -48,6 +56,15 @@ class _Segment:
     start: float
     end: float
     text: str
+
+
+@dataclass
+class _Decode:
+    """A Whisper result for the buffer as it was when decoded."""
+
+    speech_end: float
+    duration: float
+    segments: list[_Segment]
 
 
 class SpeechEngineError(Exception):
@@ -105,6 +122,7 @@ class SpeechToText:
         self._stopped = False
         self._lock = threading.Lock()
         self._last_partial = ""
+        self._last_decode: _Decode | None = None
 
     @property
     def running(self) -> bool:
@@ -150,6 +168,7 @@ class SpeechToText:
             self._running = True
             self._buffer = np.zeros(0, dtype=np.float32)
             self._last_partial = ""
+            self._last_decode = None
             self._thread = threading.Thread(target=self._worker, name="stt-worker", daemon=True)
             self._thread.start()
             logger.info("STT worker started")
@@ -173,6 +192,7 @@ class SpeechToText:
             except queue.Empty:
                 break
         self._buffer = np.zeros(0, dtype=np.float32)
+        self._last_decode = None
         logger.info("STT worker stopped")
 
     def feed_audio(self, samples: np.ndarray) -> None:
@@ -223,9 +243,12 @@ class SpeechToText:
             logger.debug("Skipping silent audio")
             self._end_phrase_without_speech(preroll)
             return
+        duration = self._buffer.size / SAMPLE_RATE
         try:
             speech = self._speech_regions(self._buffer)
-            segments = self._transcribe(self._buffer) if speech else []
+            # Judge the phrase end from the VAD, not Whisper timestamps: Whisper
+            # often leaves the last words of a buffer untranscribed until later.
+            segments = self._decode(duration, speech[-1][1]) if speech else []
         except Exception as exc:  # noqa: BLE001
             msg = f"Speech recognition failed: {exc}"
             logger.exception(msg)
@@ -235,24 +258,21 @@ class SpeechToText:
             self._end_phrase_without_speech(preroll)
             return
 
-        duration = self._buffer.size / SAMPLE_RATE
-        # Judge the phrase end from the VAD, not Whisper timestamps: Whisper
-        # often leaves the last words of a buffer untranscribed until later.
         speech_end = speech[-1][1]
         if duration - speech_end >= END_SILENCE_SECONDS:
             commit, cut = segments, speech_end
+        elif duration >= SOFT_COMMIT_SECONDS and len(segments) > 1:
+            # Still talking: finish all but the last (unfinished) segment
+            commit, cut = segments[:-1], _snap_to_pause(segments[-1].start, speech)
         elif duration >= MAX_PHRASE_SECONDS:
-            if len(segments) > 1 and duration < MAX_PHRASE_SECONDS * 1.5:
-                # Forced cut while still talking: keep the unfinished segment
-                commit, cut = segments[:-1], segments[-1].start
-            else:
-                commit, cut = segments, duration
+            commit, cut = segments, duration
         else:
             commit, cut = None, 0.0
 
         if commit is not None:
             # No pre-roll here: audio before the cut is already transcribed
             self._buffer = self._buffer[int(cut * SAMPLE_RATE) :]
+            self._last_decode = None
             text = _join(commit)
             had_partial = bool(self._last_partial)
             self._last_partial = ""
@@ -267,8 +287,22 @@ class SpeechToText:
             self._last_partial = text
             self._on_text(text, False)
 
+    def _decode(self, duration: float, speech_end: float) -> list[_Segment]:
+        """Transcribe the buffer, or reuse the last result if no new speech arrived."""
+        last = self._last_decode
+        if (
+            last is not None
+            and abs(last.speech_end - speech_end) < REUSE_SPEECH_END_SECONDS
+            and last.duration - speech_end >= REUSE_TAIL_SECONDS
+        ):
+            return last.segments
+        segments = self._transcribe(self._buffer)
+        self._last_decode = _Decode(speech_end, duration, segments)
+        return segments
+
     def _end_phrase_without_speech(self, preroll: int) -> None:
         self._buffer = self._buffer[-preroll:]
+        self._last_decode = None
         if self._last_partial:
             # A partial was shown but the audio turned out to be noise: retract it
             self._last_partial = ""
@@ -317,6 +351,13 @@ class SpeechToText:
                 self._on_status(message)
             except Exception:  # noqa: BLE001
                 logger.exception("STT status callback failed")
+
+
+def _snap_to_pause(t: float, speech: list[tuple[float, float]]) -> float:
+    """Move a cut at *t* into the nearest VAD pause, so no word is split in half."""
+    pauses = [(a[1] + b[0]) / 2 for a, b in zip(speech, speech[1:])]
+    near = [p for p in pauses if abs(p - t) <= SNAP_SECONDS]
+    return min(near, key=lambda p: abs(p - t)) if near else t
 
 
 def _join(segments: list[_Segment]) -> str:

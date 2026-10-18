@@ -98,15 +98,6 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(emitted, [("And so my fellow Americans", False)])
         self.assertEqual(stt._buffer.size, SAMPLE_RATE * 4)  # noqa: SLF001
 
-    def test_long_phrase_keeps_unfinished_segment(self) -> None:
-        stt, emitted = _engine(
-            [[_seg(0.0, 6.0, "First sentence."), _seg(6.2, 12.0, "Second still going")]]
-        )
-        stt._buffer = _speech(stt_mod.MAX_PHRASE_SECONDS)  # noqa: SLF001
-        stt._process_buffer()  # noqa: SLF001
-        self.assertEqual(emitted, [("First sentence.", True)])
-        kept = stt._buffer.size / SAMPLE_RATE  # noqa: SLF001
-        self.assertAlmostEqual(kept, 12.0 - 6.2, places=2)
 
     def test_hallucinated_non_speech_segment_dropped(self) -> None:
         bogus = SimpleNamespace(
@@ -116,6 +107,120 @@ class StreamingTests(unittest.TestCase):
         stt._buffer = _speech(1.0)  # noqa: SLF001
         stt._process_buffer()  # noqa: SLF001
         self.assertEqual(emitted, [])
+
+
+class CommitPolicyTests(unittest.TestCase):
+    """Finished sentences become final while the speaker keeps talking."""
+
+    def _run(self, seconds, segments, speech):  # noqa: ANN001, ANN202
+        stt, emitted = _engine([segments], speech_per_call=[speech])
+        stt._buffer = _speech(seconds)  # noqa: SLF001
+        stt._process_buffer()  # noqa: SLF001
+        return stt, emitted, stt._buffer.size / SAMPLE_RATE  # noqa: SLF001
+
+    def test_soft_commit_keeps_unfinished_segment(self) -> None:
+        _stt, emitted, kept = self._run(
+            stt_mod.SOFT_COMMIT_SECONDS,
+            [_seg(0.0, 2.4, "First sentence."), _seg(2.6, 5.0, "Second still going")],
+            [(0.0, 5.0)],
+        )
+        self.assertEqual(emitted, [("First sentence.", True)])
+        self.assertAlmostEqual(kept, 5.0 - 2.6, places=2)
+
+    def test_soft_commit_cut_snaps_to_nearby_pause(self) -> None:
+        # Whisper puts the boundary at 2.9 s; the real pause is 2.3–2.7 s
+        _stt, emitted, kept = self._run(
+            5.0,
+            [_seg(0.0, 2.4, "First sentence."), _seg(2.9, 5.0, "Second still going")],
+            [(0.0, 2.3), (2.7, 5.0)],
+        )
+        self.assertEqual(emitted, [("First sentence.", True)])
+        self.assertAlmostEqual(kept, 5.0 - 2.5, places=2)
+
+    def test_soft_commit_ignores_distant_pause(self) -> None:
+        _stt, emitted, kept = self._run(
+            5.0,
+            [_seg(0.0, 2.4, "First sentence."), _seg(2.9, 5.0, "Second still going")],
+            [(0.0, 1.0), (1.4, 5.0)],
+        )
+        self.assertEqual(emitted, [("First sentence.", True)])
+        self.assertAlmostEqual(kept, 5.0 - 2.9, places=2)
+
+    def test_no_soft_commit_before_threshold(self) -> None:
+        _stt, emitted, kept = self._run(
+            4.5,
+            [_seg(0.0, 2.4, "First sentence."), _seg(2.6, 4.5, "Second still going")],
+            [(0.0, 4.5)],
+        )
+        self.assertEqual(emitted, [("First sentence. Second still going", False)])
+        self.assertAlmostEqual(kept, 4.5, places=2)
+
+    def test_single_segment_stays_in_progress_below_hard_limit(self) -> None:
+        _stt, emitted, kept = self._run(8.0, [_seg(0.0, 8.0, "One long run on")], [(0.0, 8.0)])
+        self.assertEqual(emitted, [("One long run on", False)])
+        self.assertAlmostEqual(kept, 8.0, places=2)
+
+    def test_hard_commit_at_max_phrase_length(self) -> None:
+        _stt, emitted, kept = self._run(
+            stt_mod.MAX_PHRASE_SECONDS, [_seg(0.0, 10.0, "One long run on")], [(0.0, 10.0)]
+        )
+        self.assertEqual(emitted, [("One long run on", True)])
+        self.assertEqual(kept, 0.0)
+
+
+class DecodeReuseTests(unittest.TestCase):
+    """No second Whisper pass over audio that holds no new speech."""
+
+    def test_pause_reuses_last_decode_and_finalizes(self) -> None:
+        stt, emitted = _engine(
+            [[_seg(0.1, 1.5, "Hello there")]],
+            speech_per_call=[[(0.1, 1.6)], [(0.1, 1.6)]],
+        )
+        stt._buffer = _speech(2.0)  # noqa: SLF001  (decode saw 0.4 s past speech)
+        stt._process_buffer()  # noqa: SLF001
+        stt._buffer = _speech(2.3)  # noqa: SLF001  (0.7 s of silence: phrase ends)
+        stt._process_buffer()  # noqa: SLF001
+        self.assertEqual(emitted, [("Hello there", False), ("Hello there", True)])
+        self.assertEqual(stt._model.transcribe.call_count, 1)  # noqa: SLF001
+
+    def test_redecodes_when_last_decode_ended_at_the_speech(self) -> None:
+        # The first pass may have missed the last word: decode again
+        stt, emitted = _engine(
+            [[_seg(0.1, 1.2, "Hello")], [_seg(0.1, 1.5, "Hello there")]],
+            speech_per_call=[[(0.1, 1.6)], [(0.1, 1.6)]],
+        )
+        stt._buffer = _speech(1.7)  # noqa: SLF001
+        stt._process_buffer()  # noqa: SLF001
+        stt._buffer = _speech(2.3)  # noqa: SLF001
+        stt._process_buffer()  # noqa: SLF001
+        self.assertEqual(stt._model.transcribe.call_count, 2)  # noqa: SLF001
+        self.assertEqual(emitted[-1], ("Hello there", True))
+
+    def test_redecodes_when_new_speech_arrived(self) -> None:
+        stt, emitted = _engine(
+            [[_seg(0.1, 1.5, "Hello there")], [_seg(0.1, 2.2, "Hello there my friend")]],
+            speech_per_call=[[(0.1, 1.6)], [(0.1, 2.3)]],
+        )
+        stt._buffer = _speech(2.0)  # noqa: SLF001
+        stt._process_buffer()  # noqa: SLF001
+        stt._buffer = _speech(2.5)  # noqa: SLF001
+        stt._process_buffer()  # noqa: SLF001
+        self.assertEqual(stt._model.transcribe.call_count, 2)  # noqa: SLF001
+        self.assertEqual(emitted[-1], ("Hello there my friend", False))
+
+    def test_cache_cleared_after_commit_and_silence(self) -> None:
+        stt, _emitted = _engine(
+            [[_seg(0.1, 1.5, "Hello there")]],
+            speech_per_call=[[(0.1, 1.6)]],
+        )
+        stt._buffer = _speech(2.2)  # noqa: SLF001  (0.6 s of silence: commit)
+        stt._process_buffer()  # noqa: SLF001
+        self.assertIsNone(stt._last_decode)  # noqa: SLF001
+
+        stt._last_decode = stt_mod._Decode(1.0, 1.5, [])  # noqa: SLF001
+        stt._buffer = np.zeros(SAMPLE_RATE, dtype=np.float32)  # noqa: SLF001
+        stt._process_buffer()  # noqa: SLF001
+        self.assertIsNone(stt._last_decode)  # noqa: SLF001
 
 
 class EngineTests(unittest.TestCase):
