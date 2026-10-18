@@ -2,7 +2,7 @@
 
 ## Why
 
-Captions feel slow and are hard to read. Words appear about 1 s after they are spoken, and continuous speech stays unsettled for 7 s at the median (up to 12 s), so the line keeps rewriting itself. Sentences run together, separated by a single space. The caption text is a fixed 22 px, so users cannot make it larger or smaller.
+Captions feel slow and are hard to read. Words appear about 1 s after they are spoken, and continuous speech stays unsettled for 7 s at the median (up to 12 s), so the line keeps rewriting itself. Sentences run together, separated by a single space. The caption text is a fixed 22 px, so users cannot make it larger or smaller. The overlay keeps only the last 6 phrases, so a tall overlay stays mostly empty and earlier captions vanish quickly.
 
 ## What Changes
 
@@ -11,6 +11,7 @@ Captions feel slow and are hard to read. Words appear about 1 s after they are s
 - Make live captions **faster**:
   - shorten the time from a spoken word to its first appearance on screen
   - shorten the time until in-progress text settles into stable, final text, so long runs of continuous speech no longer stay unsettled for up to 12 s
+- Keep **caption history until the overlay is full**, replacing the fixed 6-phrase limit. A larger overlay or smaller font shows more earlier text, and old text scrolls off the top only when newer text needs the space.
 - Bound the CPU cost of faster captioning so it stays usable alongside video playback.
 - Add a **speech model choice** in the control window:
   - **Accurate (`base.en`)**, the default and unchanged from today.
@@ -26,7 +27,7 @@ Captions feel slow and are hard to read. Words appear about 1 s after they are s
 
 ### Modified Capabilities
 
-- `caption-overlay`: adds user-controlled, persisted caption font size and a fixed visual gap between sentences.
+- `caption-overlay`: adds user-controlled, persisted caption font size, a fixed visual gap between sentences, and caption history that fills the overlay.
 - `speech-to-text`: adds latency targets for first appearance and for stable (final) text during continuous speech, bounds on recognition work, and a user-selectable accurate/fast speech model.
 
 ## Impact

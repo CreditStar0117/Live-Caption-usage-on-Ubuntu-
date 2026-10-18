@@ -46,3 +46,22 @@ The system SHALL separate consecutive sentences in the caption text with a fixed
 #### Scenario: Numbers and inline periods
 - **WHEN** a period is not followed by whitespace (for example `3.5` or `example.com`)
 - **THEN** the system does not treat it as a sentence boundary
+
+### Requirement: Caption history fills the overlay
+The system SHALL keep earlier caption text on the overlay until the overlay is full, so a larger overlay or smaller font shows more history. Older text SHALL leave the visible area only when newer text needs the space, and the newest text SHALL always stay visible.
+
+#### Scenario: Room left on the overlay
+- **WHEN** the caption text since captioning started fits in the overlay
+- **THEN** all of it stays visible, filling the overlay from the bottom up
+
+#### Scenario: Overlay is full
+- **WHEN** new caption text no longer fits in the overlay
+- **THEN** the oldest lines scroll out of view at the top and the newest line stays visible at the bottom
+
+#### Scenario: Larger overlay shows more
+- **WHEN** the user enlarges the overlay or reduces the font size
+- **THEN** further captions fill the larger area before older text leaves the view
+
+#### Scenario: New captioning session
+- **WHEN** the user stops and starts captioning again
+- **THEN** the overlay starts empty and fills with the new session's captions

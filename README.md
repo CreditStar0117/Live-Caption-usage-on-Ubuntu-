@@ -51,7 +51,7 @@ If you see `PortAudio library not found`, either install it (`sudo apt install l
 
 ### Captions
 
-Press **Start**. Captions appear in the overlay as you hear them. The current phrase refreshes about twice a second and settles into final text when the speaker pauses. If the speaker keeps talking, finished sentences still settle after about 5 seconds, and no text stays unsettled for more than about 10 seconds. The last few phrases stay on screen. Press **Stop** to end captioning.
+Press **Start**. Captions appear in the overlay as you hear them. The current phrase refreshes about twice a second and settles into final text when the speaker pauses. If the speaker keeps talking, finished sentences still settle after about 5 seconds, and no text stays unsettled for more than about 10 seconds. Earlier captions stay on screen until the overlay is full (see **Overlay size**). Press **Stop** to end captioning.
 
 ### Speech model
 
@@ -72,6 +72,7 @@ The overlay asks the window manager to keep it above other windows. On a GNOME *
 
 - Drag the overlay window edges/corners to resize.
 - Or set **Width** / **Height** (and presets) in the control window.
+- Earlier captions stay on screen until the overlay is full. A larger overlay or smaller font keeps more history visible, and the oldest lines scroll off the top only when new text needs the space. The newest line is always visible at the bottom. Pressing **Start** again begins with an empty overlay.
 - Size is saved under `~/.config/caption-english/config.json` and restored on next launch.
 
 ### Caption text
