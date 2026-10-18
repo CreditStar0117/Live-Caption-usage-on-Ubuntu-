@@ -13,7 +13,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from caption_english.audio import AudioCapture, CaptureError, CaptureSource
-from caption_english.captions import format_captions
+from caption_english.captions import format_captions, history_capacity, trim_history
 from caption_english.config import (
     MAX_FONT_SIZE,
     MAX_HEIGHT,
@@ -32,9 +32,6 @@ from caption_english.overlay import CaptionOverlay
 from caption_english.stt import SpeechEngineError, SpeechToText, preload_model
 
 logger = logging.getLogger(__name__)
-
-# Final phrases kept on the overlay (older text scrolls away)
-MAX_CAPTION_PHRASES = 6
 
 
 class ControlWindow(Gtk.ApplicationWindow):
@@ -461,7 +458,11 @@ class CaptionEnglishApp(Gtk.Application):
             return False
         if is_final:
             self._finals.append(text)
-            del self._finals[:-MAX_CAPTION_PHRASES]
+            # Keep enough history to fill the overlay; older text scrolls away
+            capacity = history_capacity(
+                self.config.overlay_width, self.config.overlay_height, self.config.font_size
+            )
+            self._finals = trim_history(self._finals, capacity)
             self._partial = ""
         else:
             self._partial = text

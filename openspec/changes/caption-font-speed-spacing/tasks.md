@@ -27,11 +27,18 @@
 - [x] 5.2 Add a "Speech model" `Gtk.DropDown` to `ControlWindow` that is disabled while captioning, saves `model_size` on change, and warms an already-downloaded model in the background via `preload_model`. Verify in the running app that choosing Fast and pressing Start shows the download/loading status and then captions, and that the choice survives a relaunch
 - [x] 5.3 Update the README "Captions" section: refresh rate (about twice a second), finished sentences settling while the speaker keeps talking, and the Accurate/Fast model choice including the one-time `tiny.en` download. Verify the text matches app behavior
 
-## 6. Integration checks
+## 6. Caption history fills the overlay
 
-- [x] 6.1 Run the full suite with `python -m unittest discover -s tests -v` and verify all tests pass
-- [ ] 6.2 Manual acceptance with system audio playing an English video:
+- [x] 6.1 Add `history_capacity(width, height, font_px)` and `trim_history(phrases, capacity)` to `captions.py`. `trim_history` keeps the newest phrases until their total length reaches the capacity, including the phrase that crosses it, and never drops the newest phrase. Add tests that capacity grows with overlay size and shrinks with font size, and that trimming drops only the oldest phrases beyond capacity. Verify `python -m unittest tests.test_captions` passes
+- [x] 6.2 Replace `MAX_CAPTION_PHRASES` in `CaptionEnglishApp._show_text` with `trim_history`, using the current overlay size and font size from config. Verify in the running app that a tall overlay (for example 1100×350) fills to the top with earlier captions before old text scrolls away, with the newest line visible at the bottom
+- [x] 6.3 Update the README "Overlay size" section: a larger overlay or smaller font keeps more caption history on screen. Verify the text matches app behavior
+
+## 7. Integration checks
+
+- [x] 7.1 Run the full suite with `python -m unittest discover -s tests -v` and verify all tests pass
+- [ ] 7.2 Manual acceptance with system audio playing an English video:
   - captions appear noticeably faster than before
+  - the overlay fills to the top with earlier captions before old text scrolls away
   - sentences are separated by the wide gap
   - the font size changes live and persists
   - Fast mode works after a restart

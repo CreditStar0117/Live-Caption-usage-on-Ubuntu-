@@ -74,6 +74,21 @@ Measured with Pango, the gap is exactly 1.5 em: 33 px at 22 px and 60 px at 40 p
 - The control window gets a "Font size" `Gtk.SpinButton` with range 12–72 and step 2, in a "Caption text" frame. It saves immediately, as the size controls do.
 - *Alternative:* a Pango size attribute on the label. Rejected: CSS already styles the label, and two sources of truth would conflict.
 
+### D8a. Caption history sized to the overlay (replaces the 6-phrase limit)
+The app used to keep the last 6 final phrases. Since D2, phrases are at most about 5 s long, so 6 of them fill only a few lines of a tall overlay. The app now keeps final phrases, newest first, until their total length reaches the overlay's capacity. It drops older phrases only beyond that point.
+
+Capacity, in a pure function `history_capacity(width, height, font_px)` in `captions.py`, is:
+
+    (width / (0.33 × font)) × (height / (1.14 × font)) × 1.5
+
+The 0.33 em character width and 1.14 em line height are the smallest values measured with Pango across Sans, Ubuntu and Cantarell, so the estimate leans toward too much text rather than too little. The 1.5× margin covers wrap waste at line ends and a later resize. Overflow is harmless: the scroller keeps the newest line in view, and older text sits above the visible area.
+
+The app reads the overlay size and font size from config, which follows drag-resizes, the size spins and the font spin.
+
+Measured Pango layout cost per update is 1 ms for 2k characters (a 761×308 overlay at 22 px) and 27 ms for 60k characters (the 2400×900 maximum at 12 px), at most twice a second.
+- *Alternative:* unlimited history. Rejected: layout cost and memory grow for the whole session.
+- *Alternative:* measure real overflow in the overlay and trim to it. Rejected: it is exact, but it needs a layout pass before trimming and couples the overlay back to the app's phrase list.
+
 ### D8. Config parsing per field for `font_size`
 `AppConfig.font_size` defaults to 22, with `clamp_font_size()` bounding it to 12–72. `load_config` parses `font_size` in its own try/except, so a bad value falls back to 22 without resetting the other settings. A missing key also gives 22, so older config files load unchanged.
 

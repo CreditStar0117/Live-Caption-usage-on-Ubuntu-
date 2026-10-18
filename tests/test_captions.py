@@ -1,12 +1,46 @@
-"""Tests for caption paragraph formatting and the sentence gap."""
+"""Tests for caption history, paragraph formatting and the sentence gap."""
 
 from __future__ import annotations
 
 import unittest
 
-from caption_english.captions import SENTENCE_GAP, format_captions
+from caption_english.captions import (
+    SENTENCE_GAP,
+    format_captions,
+    history_capacity,
+    trim_history,
+)
 
 G = SENTENCE_GAP
+
+
+class HistoryTests(unittest.TestCase):
+    def test_capacity_grows_with_overlay_size(self) -> None:
+        small = history_capacity(560, 100, 22)
+        self.assertGreater(history_capacity(1100, 100, 22), small)
+        self.assertGreater(history_capacity(560, 350, 22), small)
+
+    def test_capacity_shrinks_with_font_size(self) -> None:
+        self.assertLess(history_capacity(800, 300, 40), history_capacity(800, 300, 22))
+
+    def test_capacity_covers_a_full_overlay(self) -> None:
+        # 761x308 at 22 px fits roughly 1000-1300 characters of English text
+        self.assertGreaterEqual(history_capacity(761, 308, 22), 1300)
+
+    def test_keeps_everything_under_capacity(self) -> None:
+        phrases = ["One.", "Two.", "Three."]
+        self.assertEqual(trim_history(phrases, 1000), phrases)
+        self.assertEqual(trim_history([], 1000), [])
+
+    def test_drops_only_oldest_beyond_capacity(self) -> None:
+        phrases = [f"{i}" * 99 for i in range(10)]  # 100 characters each with a space
+        kept = trim_history(phrases, 350)
+        # Newest three hold 300 characters; the fourth crosses 350 and is kept
+        self.assertEqual(kept, phrases[-4:])
+
+    def test_never_drops_newest_phrase(self) -> None:
+        phrases = ["old", "x" * 500]
+        self.assertEqual(trim_history(phrases, 100), ["x" * 500])
 
 
 class SentenceGapTests(unittest.TestCase):
