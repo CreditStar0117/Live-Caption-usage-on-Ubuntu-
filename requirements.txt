@@ -1,0 +1,9 @@
+# Pip packages (install into a venv that can see system PyGObject/GTK).
+# Create with: python3 -m venv --system-site-packages .venv
+faster-whisper>=1.1.0
+numpy>=1.24
+sounddevice>=0.4.6
+pulsectl>=24.4.0
+
+# System packages (Ubuntu) — install with apt, not pip:
+#   sudo apt install python3-gi gir1.2-gtk-4.0 pipewire-pulse pulseaudio-utils libportaudio2
