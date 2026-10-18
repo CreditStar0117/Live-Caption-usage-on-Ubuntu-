@@ -20,7 +20,8 @@ sudo apt install -y \
 ## Install
 
 ```bash
-cd Caption-English
+git clone https://github.com/CreditStar0117/Live-Caption-usage-on-Ubuntu-.git
+cd Live-Caption-usage-on-Ubuntu-
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -U pip
