@@ -1,4 +1,4 @@
-"""XDG config for overlay size and audio source preferences."""
+"""XDG config for overlay size, caption text, audio source and model preferences."""
 
 from __future__ import annotations
 
@@ -16,12 +16,41 @@ MIN_HEIGHT = 80
 MAX_HEIGHT = 900
 DEFAULT_WIDTH = 800
 DEFAULT_HEIGHT = 160
+MIN_FONT_SIZE = 12
+MAX_FONT_SIZE = 72
+DEFAULT_FONT_SIZE = 22
+DEFAULT_MODEL = "base.en"
+# Speech models offered in the control window: (model name, label)
+MODEL_CHOICES = (
+    (DEFAULT_MODEL, "Accurate (base.en)"),
+    ("tiny.en", "Fast (tiny.en)"),
+)
 
 
 def clamp_size(width: int, height: int) -> tuple[int, int]:
     w = max(MIN_WIDTH, min(MAX_WIDTH, int(width)))
     h = max(MIN_HEIGHT, min(MAX_HEIGHT, int(height)))
     return w, h
+
+
+def clamp_font_size(size: int) -> int:
+    return max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, int(size)))
+
+
+def model_choices(current: str) -> list[tuple[str, str]]:
+    """Offered models, plus *current* if it is another (e.g. hand-edited) model."""
+    choices = list(MODEL_CHOICES)
+    if current and current not in dict(choices):
+        choices.append((current, current))
+    return choices
+
+
+def _parse_font_size(value: object) -> int:
+    # Parsed on its own so a bad value does not reset the other settings
+    try:
+        return clamp_font_size(int(value))  # type: ignore[call-overload]
+    except (TypeError, ValueError, OverflowError):
+        return DEFAULT_FONT_SIZE
 
 
 def config_dir() -> Path:
@@ -43,8 +72,9 @@ class AppConfig:
     overlay_x: int | None = None
     overlay_y: int | None = None
     audio_source: AudioSource = "system"
-    model_size: str = "base.en"
+    model_size: str = DEFAULT_MODEL
     overlay_visible: bool = True
+    font_size: int = DEFAULT_FONT_SIZE
 
     def clamped(self) -> AppConfig:
         w, h = clamp_size(self.overlay_width, self.overlay_height)
@@ -54,8 +84,9 @@ class AppConfig:
             overlay_x=self.overlay_x,
             overlay_y=self.overlay_y,
             audio_source=self.audio_source if self.audio_source in ("mic", "system", "both") else "system",
-            model_size=self.model_size or "base.en",
+            model_size=self.model_size or DEFAULT_MODEL,
             overlay_visible=bool(self.overlay_visible),
+            font_size=clamp_font_size(self.font_size),
         )
 
 
@@ -71,8 +102,9 @@ def load_config() -> AppConfig:
             overlay_x=data.get("overlay_x"),
             overlay_y=data.get("overlay_y"),
             audio_source=data.get("audio_source", "system"),
-            model_size=data.get("model_size", "base.en"),
+            model_size=data.get("model_size", DEFAULT_MODEL),
             overlay_visible=bool(data.get("overlay_visible", True)),
+            font_size=_parse_font_size(data.get("font_size", DEFAULT_FONT_SIZE)),
         )
         return cfg.clamped()
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
