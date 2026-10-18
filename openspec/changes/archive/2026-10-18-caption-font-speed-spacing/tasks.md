@@ -36,7 +36,7 @@
 ## 7. Integration checks
 
 - [x] 7.1 Run the full suite with `python -m unittest discover -s tests -v` and verify all tests pass
-- [ ] 7.2 Manual acceptance with system audio playing an English video:
+- [x] 7.2 Manual acceptance with system audio playing an English video:
   - captions appear noticeably faster than before
   - the overlay fills to the top with earlier captions before old text scrolls away
   - sentences are separated by the wide gap
