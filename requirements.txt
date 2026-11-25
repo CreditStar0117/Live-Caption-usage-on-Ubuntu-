@@ -4,6 +4,10 @@ faster-whisper>=1.1.0
 numpy>=1.24
 sounddevice>=0.4.6
 pulsectl>=24.4.0
+# Korean translation (already installed with faster-whisper)
+ctranslate2>=4.0
+tokenizers>=0.13
+huggingface_hub>=0.13
 
 # System packages (Ubuntu) — install with apt, not pip:
-#   sudo apt install python3-gi gir1.2-gtk-4.0 pipewire-pulse pulseaudio-utils libportaudio2
+#   sudo apt install python3-gi gir1.2-gtk-4.0 pipewire-pulse pulseaudio-utils libportaudio2 fonts-noto-cjk

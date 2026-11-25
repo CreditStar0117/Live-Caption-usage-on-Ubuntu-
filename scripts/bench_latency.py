@@ -6,7 +6,11 @@ blocks, like the audio capture does) and reports how long after each word is
 spoken it first shows up in the captions, and when it becomes final text.
 Word times come from an offline transcription of the same audio.
 
-    .venv/bin/python scripts/bench_latency.py talk.mp3 [--model tiny.en]
+    .venv/bin/python scripts/bench_latency.py talk.mp3 [--model tiny.en] [--translate]
+
+With --translate, final text also goes through the Korean translation path the
+app uses (sentence blocks, then the translator), and the delay from a block's
+English being complete to its Korean arriving is reported too.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -26,7 +31,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from caption_english.audio import BLOCK_FRAMES, SAMPLE_RATE  # noqa: E402
+from caption_english import translate  # noqa: E402
+from caption_english.captions import BilingualCaptions  # noqa: E402
 from caption_english.stt import SpeechToText  # noqa: E402
+
+
+# Long enough for the 2 s quiet flush plus one translation
+FLUSH_WAIT = 4.0
 
 
 def load_audio(path: str, start: float, seconds: float) -> np.ndarray:
@@ -76,6 +87,8 @@ def main() -> None:
     parser.add_argument("--model", default="base.en")
     parser.add_argument("--start", type=float, default=0.0, help="offset into the file (s)")
     parser.add_argument("--seconds", type=float, default=90.0, help="length to play (s)")
+    parser.add_argument("--translate", action="store_true", help="also translate into Korean")
+    parser.add_argument("--beam", type=int, default=translate.BEAM_SIZE, help="translation beam size")
     args = parser.parse_args()
 
     audio = load_audio(args.audio, args.start, args.seconds)
@@ -89,6 +102,15 @@ def main() -> None:
     decodes: list[float] = []
     t0 = 0.0
 
+    # Korean path: same block grouping as the app, guarded by one lock because
+    # here the STT, translator and flush threads all touch it
+    caps_lock = threading.Lock()
+    block_done: dict[int, float] = {}
+    korean_at: dict[int, float] = {}
+    batch_times: list[tuple[int, float]] = []
+    translator: translate.Translator | None = None
+    caps: BilingualCaptions | None = None
+
     def on_text(text: str, is_final: bool) -> None:
         nonlocal partial
         t = time.monotonic() - t0
@@ -99,6 +121,12 @@ def main() -> None:
         else:
             partial = text
         any_events.append((t, " ".join([*finals, partial])))
+        if caps is not None:
+            with caps_lock:
+                if is_final:
+                    caps.add_final(text)
+                else:
+                    caps.set_partial(text)
 
     engine = SpeechToText(on_text=on_text, on_error=print, model_size=args.model)
     engine.load_model()
@@ -122,8 +150,46 @@ def main() -> None:
             return segs, info
 
     engine._model = TimedModel()  # noqa: SLF001
+
+    stop_flush = threading.Event()
+    if args.translate:
+        translate.BEAM_SIZE = args.beam
+
+        def on_korean(block_id: int, korean: str) -> None:
+            korean_at[block_id] = time.monotonic() - t0
+            with caps_lock:
+                caps.set_translation(block_id, korean)  # type: ignore[union-attr]
+
+        translator = translate.Translator(on_result=on_korean, on_error=print, on_status=print)
+        translator.load_model()
+        inner = translator._translate  # noqa: SLF001
+
+        def timed_translate(texts: list[str]) -> list[str]:
+            start = time.monotonic()
+            out = inner(texts)
+            batch_times.append((len(texts), time.monotonic() - start))
+            return out
+
+        translator._translate = timed_translate  # type: ignore[method-assign]  # noqa: SLF001
+
+        def submit(block_id: int, english: str) -> None:
+            block_done[block_id] = time.monotonic() - t0
+            translator.submit(block_id, english)  # type: ignore[union-attr]
+
+        caps = BilingualCaptions(submit=submit)
+
+        def flush_loop() -> None:
+            while not stop_flush.wait(0.25):
+                with caps_lock:
+                    caps.flush_due()  # type: ignore[union-attr]
+
+        threading.Thread(target=flush_loop, daemon=True).start()
+        print(f"Korean translation on (beam {args.beam})")
+
     print(f"Playing {audio_s:.0f} s in real time…")
     engine.start()
+    if translator:
+        translator.start()
     t0 = time.monotonic()
     noise = np.random.default_rng(0).normal(0, 0.001, SAMPLE_RATE * 3).astype(np.float32)
     stream = np.concatenate([audio, noise])  # trailing quiet lets the last phrase end
@@ -134,6 +200,10 @@ def main() -> None:
         engine.feed_audio(stream[i * BLOCK_FRAMES : (i + 1) * BLOCK_FRAMES])
     time.sleep(1.5)
     engine.stop()
+    if translator:
+        time.sleep(FLUSH_WAIT)  # let the last unfinished sentence flush and translate
+        stop_flush.set()
+        translator.stop()
     wall = time.monotonic() - t0
 
     print()
@@ -144,6 +214,25 @@ def main() -> None:
             f"Decodes:           {len(decodes)}, median {1000 * statistics.median(decodes):.0f} ms, "
             f"max {1000 * max(decodes):.0f} ms, busy {100 * sum(decodes) / wall:.0f}% of the time"
         )
+    if args.translate:
+        delays = sorted(korean_at[i] - block_done[i] for i in block_done if i in korean_at)
+        missing = len(block_done) - len(delays)
+        if delays:
+            p90 = delays[min(len(delays) - 1, int(len(delays) * 0.9))]
+            print(
+                f"Korean delay:      median {statistics.median(delays):.2f} s, p90 {p90:.2f} s "
+                f"({len(delays)} blocks, {missing} untranslated)"
+            )
+        if batch_times:
+            per_block = [t / n for n, t in batch_times]
+            print(
+                f"Translations:      {len(batch_times)} batches, median {1000 * statistics.median(per_block):.0f} ms "
+                f"per block, max batch {1000 * max(t for _n, t in batch_times):.0f} ms, "
+                f"busy {100 * sum(t for _n, t in batch_times) / wall:.0f}% of the time"
+            )
+        print()
+        for block in caps.blocks[-6:]:  # type: ignore[union-attr]
+            print(f"  EN: {block.english}\n  KO: {block.korean}")
 
 
 if __name__ == "__main__":
