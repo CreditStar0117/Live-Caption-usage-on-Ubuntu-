@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0] - 2026-11-25
+
+Keep and save what was said: a full English caption history you can save as a text file.
+
+### Added
+
+- **Caption history**: everything captioned in English while the app is open is kept, including captions that have scrolled off the overlay. It carries on across Stop and Start, and the control window shows how many sentences it holds. Only final English text is recorded, never in-progress text or Korean translations.
+- **Save history…** writes the history to a UTF-8 text file you choose, with one `[HH:MM:SS] sentence` line per sentence and a line for each session's start time and audio source. Saving works while captioning and does not interrupt it. A failed save shows in red, keeps the history and never leaves a half-written file.
+- **Clear…** empties the history after asking.
+- Closing the app with unsaved history asks whether to save, discard or cancel.
+- Saving and clearing need GTK 4.10 or newer.
+
 ## [1.1.0] - 2026-11-25
 
 Live Korean translation of the English captions, run on your own computer.

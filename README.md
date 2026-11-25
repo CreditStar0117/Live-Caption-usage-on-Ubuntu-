@@ -109,6 +109,34 @@ ct2-transformers-converter --model facebook/nllb-200-distilled-600M \
 CAPTION_ENGLISH_TRANSLATION_MODEL=~/nllb-600m-ct2 ./scripts/run.sh
 ```
 
+### Caption history
+
+The app keeps everything it captions in English while it is open, including captions that have already scrolled off the overlay. The **Caption history** box in the control window shows how many sentences it holds.
+
+- Only final English text is recorded. Text still in progress is not, and Korean translations never are, even with **Korean translation** on.
+- The history carries on across **Stop** and **Start**. It is emptied only when you press **Clear…** (which asks first) or quit the app.
+- Nothing is written to disk until you press **Save history…**. It opens a file dialog suggesting a name such as `caption-history-2026-11-25-143012.txt` in your Documents folder. You can save while captioning, and captioning carries on.
+- If you close the app with history that has not been saved, it asks whether to **Save…**, **Discard** or **Cancel**.
+- If the file cannot be written, the error shows in red in the **Caption history** box and the history is kept. Saving over an existing file never leaves it half written.
+
+The saved file is UTF-8 plain text, with one line per sentence and a line for each **Start**:
+
+```
+Caption English caption history
+Saved 2026-11-25 14:30:12
+
+--- Session started 2026-11-25 14:02:55 (system audio) ---
+[14:03:01] Welcome back to the show.
+[14:03:04] Today we talk about Linux audio.
+
+--- Session started 2026-11-25 14:20:40 (mic audio) ---
+[14:20:43] Can everyone hear me?
+```
+
+Times are approximate. They show when a sentence's first words became final text, which is usually about half a second after they were spoken, and up to about 10 seconds later in long, unbroken speech. A sentence still unfinished when you save is included as the last line.
+
+Saving and clearing need GTK 4.10 or newer (Ubuntu 23.04 and later). On older GTK the history box says so, and the rest of the app works as before.
+
 ## Desktop launcher
 
 ```bash
@@ -152,4 +180,4 @@ With translation on, English captions keep the same latency, and Korean typicall
 
 ## Privacy
 
-Transcription runs locally via `faster-whisper`, and Korean translation runs locally via CTranslate2. No audio or caption text is uploaded by this app. The network is used only to download models the first time they are needed.
+Transcription runs locally via `faster-whisper`, and Korean translation runs locally via CTranslate2. No audio or caption text is uploaded by this app. The network is used only to download models the first time they are needed. The caption history stays in memory and is written to disk only when you save it, to the file you choose.
