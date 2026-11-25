@@ -162,6 +162,15 @@ class CaptionOverlay(Gtk.Window):
 
         GLib.idle_add(_set)
 
+    def set_caption_markup(self, markup: str) -> None:
+        """Show Pango markup (English with Korean below); the caller escapes all text."""
+
+        def _set() -> bool:
+            self._label.set_markup(markup or "")
+            return False
+
+        GLib.idle_add(_set)
+
     def set_size_px(self, width: int, height: int) -> None:
         w, h = clamp_size(width, height)
         self._width, self._height = w, h

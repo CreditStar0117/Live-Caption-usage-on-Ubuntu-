@@ -101,6 +101,45 @@ class ConfigPersistTests(unittest.TestCase):
                     self.assertEqual(cfg.overlay_width, 700, bad)
 
 
+class TranslationSettingTests(unittest.TestCase):
+    def test_default_is_off(self) -> None:
+        self.assertFalse(AppConfig().translate_korean)
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+                self.assertFalse(load_config().translate_korean)
+
+    def test_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+                save_config(AppConfig(translate_korean=True, font_size=30))
+                cfg = load_config()
+                self.assertTrue(cfg.translate_korean)
+                self.assertEqual(cfg.font_size, 30)
+                save_config(AppConfig(translate_korean=False))
+                self.assertFalse(load_config().translate_korean)
+
+    def test_config_before_translation_support(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+                _write_config(
+                    tmp, {"overlay_width": 700, "font_size": 30, "model_size": "tiny.en"}
+                )
+                cfg = load_config()
+                self.assertFalse(cfg.translate_korean)
+                self.assertEqual(cfg.overlay_width, 700)
+                self.assertEqual(cfg.font_size, 30)
+                self.assertEqual(cfg.model_size, "tiny.en")
+
+    def test_invalid_value_keeps_other_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+                for bad in ("yes", 1, None, [True], {"on": True}):
+                    _write_config(tmp, {"translate_korean": bad, "overlay_width": 700})
+                    cfg = load_config()
+                    self.assertFalse(cfg.translate_korean, bad)
+                    self.assertEqual(cfg.overlay_width, 700, bad)
+
+
 class ModelChoiceTests(unittest.TestCase):
     def test_offered_models(self) -> None:
         expected = [("base.en", "Accurate (base.en)"), ("tiny.en", "Fast (tiny.en)")]

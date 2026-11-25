@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
+from datetime import datetime
 from typing import Any
 
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from caption_english.audio import AudioCapture, CaptureError, CaptureSource
-from caption_english.captions import format_captions, history_capacity, trim_history
+from caption_english import translate
+from caption_english.captions import (
+    BilingualCaptions,
+    format_captions,
+    history_capacity,
+    trim_history,
+)
 from caption_english.config import (
     MAX_FONT_SIZE,
     MAX_HEIGHT,
@@ -28,10 +36,43 @@ from caption_english.config import (
     model_choices,
     save_config,
 )
+from caption_english.history import (
+    CaptionHistory,
+    default_filename,
+    history_summary,
+    write_transcript,
+)
 from caption_english.overlay import CaptionOverlay
 from caption_english.stt import SpeechEngineError, SpeechToText, preload_model
+from caption_english.translate import TranslationError, Translator
 
 logger = logging.getLogger(__name__)
+
+# How often an unfinished sentence is checked for translation (ms)
+FLUSH_CHECK_MS = 250
+TRANSLATION_OFF = "Off. English captions only."
+TRANSLATION_NEXT_START = "Korean appears under each English sentence from the next Start."
+# The save and confirm dialogs need GTK 4.10 (Ubuntu 22.04 ships 4.6)
+HAS_DIALOGS = hasattr(Gtk, "FileDialog") and hasattr(Gtk, "AlertDialog")
+HISTORY_NEEDS_GTK = "Saving history needs GTK 4.10 or newer."
+
+
+def _sentences(count: int) -> str:
+    return f"{count} sentence" if count == 1 else f"{count} sentences"
+
+
+def _documents_folder() -> str:
+    documents = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+    if documents and os.path.isdir(documents):
+        return documents
+    return GLib.get_home_dir()
+
+
+def _dialog_dismissed(exc: GLib.Error) -> bool:
+    quark = Gtk.dialog_error_quark()
+    return exc.matches(quark, Gtk.DialogError.DISMISSED) or exc.matches(
+        quark, Gtk.DialogError.CANCELLED
+    )
 
 
 class ControlWindow(Gtk.ApplicationWindow):
@@ -157,6 +198,71 @@ class ControlWindow(Gtk.ApplicationWindow):
         text_box.append(font_row)
         root.append(text_frame)
 
+        # Korean translation
+        tr_frame = Gtk.Frame(label="Translation")
+        tr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        tr_box.set_margin_top(8)
+        tr_box.set_margin_bottom(8)
+        tr_box.set_margin_start(8)
+        tr_box.set_margin_end(8)
+        tr_frame.set_child(tr_box)
+
+        tr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        tr_label = Gtk.Label(label="Korean translation", xalign=0.0)
+        tr_label.set_hexpand(True)
+        tr_row.append(tr_label)
+        self.translate_switch = Gtk.Switch(active=app.config.translate_korean)
+        self.translate_switch.set_valign(Gtk.Align.CENTER)
+        self.translate_switch.connect(
+            "notify::active", lambda sw, _p: app.set_translate_korean(sw.get_active())
+        )
+        tr_row.append(self.translate_switch)
+        tr_box.append(tr_row)
+
+        self.translation_status = Gtk.Label(
+            label=TRANSLATION_NEXT_START if app.config.translate_korean else TRANSLATION_OFF,
+            xalign=0.0,
+            wrap=True,
+        )
+        self.translation_status.add_css_class("dim-label")
+        tr_box.append(self.translation_status)
+        root.append(tr_frame)
+
+        # English caption history for this app run
+        hist_frame = Gtk.Frame(label="Caption history")
+        hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hist_box.set_margin_top(8)
+        hist_box.set_margin_bottom(8)
+        hist_box.set_margin_start(8)
+        hist_box.set_margin_end(8)
+        hist_frame.set_child(hist_box)
+
+        hist_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.history_summary = Gtk.Label(
+            label=history_summary(0, None), xalign=0.0, wrap=True
+        )
+        self.history_summary.set_hexpand(True)
+        hist_row.append(self.history_summary)
+        self.save_history_btn = Gtk.Button(label="Save history…")
+        self.save_history_btn.set_sensitive(False)
+        self.save_history_btn.connect("clicked", lambda *_: app.save_history())
+        hist_row.append(self.save_history_btn)
+        self.clear_history_btn = Gtk.Button(label="Clear…")
+        self.clear_history_btn.set_sensitive(False)
+        self.clear_history_btn.connect("clicked", lambda *_: app.clear_history())
+        hist_row.append(self.clear_history_btn)
+        hist_box.append(hist_row)
+
+        self.history_error = Gtk.Label(xalign=0.0, wrap=True)
+        if HAS_DIALOGS:
+            self.history_error.add_css_class("error")
+            self.history_error.set_visible(False)
+        else:
+            self.history_error.set_text(HISTORY_NEEDS_GTK)
+            self.history_error.add_css_class("dim-label")
+        hist_box.append(self.history_error)
+        root.append(hist_frame)
+
         # Actions
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_btn = Gtk.Button(label="Start")
@@ -175,7 +281,11 @@ class ControlWindow(Gtk.ApplicationWindow):
         root.append(actions)
 
         hint = Gtk.Label(
-            label="The first start with each speech model downloads it (local, English).",
+            label=(
+                "The first start with each speech model downloads it (local, English). "
+                f"Korean translation downloads its model (~{translate.DOWNLOAD_MB} MB) "
+                "the first time it is used. Everything runs on this computer."
+            ),
             wrap=True,
             xalign=0.0,
         )
@@ -219,12 +329,26 @@ class ControlWindow(Gtk.ApplicationWindow):
 
         GLib.idle_add(_set)
 
+    def set_translation_status(self, text: str, error: bool = False) -> None:
+        def _set() -> bool:
+            self.translation_status.set_text(text)
+            if error:
+                self.translation_status.remove_css_class("dim-label")
+                self.translation_status.add_css_class("error")
+            else:
+                self.translation_status.remove_css_class("error")
+                self.translation_status.add_css_class("dim-label")
+            return False
+
+        GLib.idle_add(_set)
+
     def set_running(self, running: bool) -> None:
         def _set() -> bool:
             self.start_btn.set_sensitive(not running)
             self.stop_btn.set_sensitive(running)
             self.source_combo.set_sensitive(not running)
             self.model_combo.set_sensitive(not running)
+            self.translate_switch.set_sensitive(not running)
             return False
 
         GLib.idle_add(_set)
@@ -240,6 +364,19 @@ class ControlWindow(Gtk.ApplicationWindow):
             return False
 
         GLib.idle_add(_set)
+
+    def update_history(self, count: int, saved_name: str | None) -> None:
+        """Show the history size; call on the GTK thread."""
+        self.history_summary.set_text(history_summary(count, saved_name))
+        self.save_history_btn.set_sensitive(HAS_DIALOGS and count > 0)
+        self.clear_history_btn.set_sensitive(HAS_DIALOGS and count > 0)
+
+    def set_history_error(self, text: str) -> None:
+        """Show a save error in red, or hide it with an empty text; call on the GTK thread."""
+        if not HAS_DIALOGS:
+            return
+        self.history_error.set_text(text)
+        self.history_error.set_visible(bool(text))
 
     def set_overlay_button_label(self, visible: bool) -> None:
         def _set() -> bool:
@@ -263,6 +400,16 @@ class CaptionEnglishApp(Gtk.Application):
         self._finals: list[str] = []
         self._partial = ""
         self._size_save_timeout: int | None = None
+        # Set while a session captions with Korean translation
+        self.translator: Translator | None = None
+        self._bilingual: BilingualCaptions | None = None
+        self._flush_timer: int | None = None
+        # Final English for the whole app run, saved only when the user asks
+        self.history = CaptionHistory()
+        self._history_folder: str | None = None
+        self._history_saved_name: str | None = None
+        # Set while the "save before quitting?" prompt or its save dialog is open
+        self._closing_prompt = False
 
     def do_activate(self) -> None:  # noqa: N802
         if self.control is None:
@@ -281,6 +428,8 @@ class CaptionEnglishApp(Gtk.Application):
                 self.overlay.hide_overlay()
             self.control.set_overlay_button_label(self.overlay.is_overlay_visible())
             self._preload_model()
+            if self.config.translate_korean:
+                self._preload_translation()
         self.control.present()
 
     def _preload_model(self) -> None:
@@ -292,11 +441,146 @@ class CaptionEnglishApp(Gtk.Application):
             daemon=True,
         ).start()
 
+    def _preload_translation(self) -> None:
+        # Warm the translation model so Korean starts quickly (only if already downloaded)
+        threading.Thread(
+            target=translate.preload_model, name="translation-preload", daemon=True
+        ).start()
+
     def _on_control_close(self, *_args) -> bool:  # noqa: ANN001
+        if HAS_DIALOGS and self.history.has_unsaved:
+            # Keep the window (and captioning) until the user decides
+            if not self._closing_prompt:
+                self._closing_prompt = True
+                self._ask_before_quit()
+            return True
+        self._quit()
+        return False
+
+    def _quit(self) -> None:
         self.stop_captioning()
         self._persist_config()
         self.quit()
-        return False
+
+    def _ask_before_quit(self) -> None:
+        count = self.history.sentence_count
+        dialog = Gtk.AlertDialog(
+            message="Save caption history before quitting?",
+            detail=f"{_sentences(count)} of English captions have not been saved. "
+            "They are lost if you quit without saving.",
+            buttons=["Cancel", "Discard", "Save…"],
+            cancel_button=0,
+            default_button=2,
+            modal=True,
+        )
+        dialog.choose(self.control, None, self._on_quit_chosen)
+
+    def _on_quit_chosen(self, dialog: Gtk.AlertDialog, result: Gio.AsyncResult) -> None:
+        try:
+            choice = dialog.choose_finish(result)
+        except GLib.Error:
+            choice = 0
+        if choice == 2:
+            self.save_history(quit_after=True)
+        elif choice == 1:
+            self._quit()
+        else:
+            self._closing_prompt = False
+
+    def _refresh_history(self) -> None:
+        if self.control:
+            saved = None if self.history.has_unsaved else self._history_saved_name
+            self.control.update_history(self.history.sentence_count, saved)
+
+    def save_history(self, quit_after: bool = False) -> None:
+        """Ask where to save the English caption history, then write it there."""
+        if not HAS_DIALOGS or self.control is None:
+            return
+        dialog = Gtk.FileDialog(title="Save caption history", modal=True)
+        dialog.set_initial_name(default_filename(datetime.now()))
+        dialog.set_initial_folder(
+            Gio.File.new_for_path(self._history_folder or _documents_folder())
+        )
+        text_files = Gtk.FileFilter(name="Text files (*.txt)")
+        text_files.add_suffix("txt")
+        all_files = Gtk.FileFilter(name="All files")
+        all_files.add_pattern("*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(text_files)
+        filters.append(all_files)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(text_files)
+        dialog.save(self.control, None, self._on_save_chosen, quit_after)
+
+    def _on_save_chosen(
+        self, dialog: Gtk.FileDialog, result: Gio.AsyncResult, quit_after: bool
+    ) -> None:
+        try:
+            gfile = dialog.save_finish(result)
+        except GLib.Error as exc:
+            if not _dialog_dismissed(exc):
+                self._history_save_failed(f"Could not save history: {exc.message}")
+            self._closing_prompt = False
+            return
+        path = gfile.get_path() if gfile else None
+        if not path:
+            self._history_save_failed("Could not save history: choose a folder on this computer.")
+            return
+        # Written synchronously, so nothing is recorded between these two lines
+        revision = self.history.revision
+        try:
+            write_transcript(path, self.history.transcript(datetime.now()))
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            self._history_save_failed(f"Could not save {os.path.basename(path)}: {reason}")
+            return
+        self.history.mark_saved(revision)
+        self._history_folder = os.path.dirname(path)
+        self._history_saved_name = os.path.basename(path)
+        logger.info("Saved caption history to %s", path)
+        if self.control:
+            self.control.set_history_error("")
+        self._refresh_history()
+        if quit_after:
+            self._quit()
+
+    def _history_save_failed(self, message: str) -> None:
+        logger.error(message)
+        # A failed save while quitting keeps the app open
+        self._closing_prompt = False
+        if self.control:
+            self.control.set_history_error(message)
+
+    def clear_history(self) -> None:
+        """Empty the caption history once the user confirms."""
+        count = self.history.sentence_count
+        if not HAS_DIALOGS or self.control is None or count == 0:
+            return
+        detail = f"{_sentences(count)} will be removed."
+        if self.history.has_unsaved:
+            detail += " They have not been saved." if count > 1 else " It has not been saved."
+        dialog = Gtk.AlertDialog(
+            message="Clear caption history?",
+            detail=detail,
+            buttons=["Cancel", "Clear"],
+            cancel_button=0,
+            default_button=0,
+            modal=True,
+        )
+        dialog.choose(self.control, None, self._on_clear_chosen)
+
+    def _on_clear_chosen(self, dialog: Gtk.AlertDialog, result: Gio.AsyncResult) -> None:
+        try:
+            choice = dialog.choose_finish(result)
+        except GLib.Error:
+            return
+        if choice != 1:
+            return
+        self.history.clear()
+        self._history_saved_name = None
+        if self.control:
+            self.control.set_history_error("")
+        self._refresh_history()
 
     def _on_overlay_close(self, *_args) -> bool:  # noqa: ANN001
         # Hide instead of destroy so show/hide still works
@@ -320,6 +604,19 @@ class CaptionEnglishApp(Gtk.Application):
         self.config.model_size = model
         self._persist_config()
         self._preload_model()
+
+    def set_translate_korean(self, on: bool) -> None:
+        """Turn Korean translation on or off; it applies from the next Start."""
+        if on == self.config.translate_korean:
+            return
+        self.config.translate_korean = on
+        self._persist_config()
+        if self.control:
+            self.control.set_translation_status(
+                TRANSLATION_NEXT_START if on else TRANSLATION_OFF
+            )
+        if on:
+            self._preload_translation()
 
     def apply_overlay_size(self, width: int, height: int) -> None:
         w, h = clamp_size(width, height)
@@ -381,11 +678,15 @@ class CaptionEnglishApp(Gtk.Application):
         source = CaptureSource(self.config.audio_source)
         self._finals = []
         self._partial = ""
+        self._bilingual = None
+        self.history.start_session(source.value)
         if self.overlay:
             self.overlay.set_caption_text("")
         if self.control:
             self.control.set_status("Starting…")
             self.control.set_running(True)
+        if self.config.translate_korean:
+            self._start_translation(session)
 
         def _boot() -> None:
             stt = SpeechToText(
@@ -413,6 +714,43 @@ class CaptionEnglishApp(Gtk.Application):
             GLib.idle_add(self._finish_boot, session, capture, stt)
 
         threading.Thread(target=_boot, name="caption-boot", daemon=True).start()
+
+    def _start_translation(self, session: int) -> None:
+        """Load the translator next to captioning; English never waits for it."""
+        translator = Translator(
+            on_result=lambda block_id, korean: GLib.idle_add(
+                self._show_translation, session, block_id, korean
+            ),
+            on_error=lambda msg: GLib.idle_add(self._translation_failed, session, msg),
+            on_status=lambda msg: self._on_translation_status(session, msg),
+        )
+        self.translator = translator
+        # Blocks finished while the model loads wait in the translator's queue
+        self._bilingual = BilingualCaptions(submit=translator.submit, discard=translator.discard)
+        self._flush_timer = GLib.timeout_add(FLUSH_CHECK_MS, self._flush_tick, session)
+
+        def _boot() -> None:
+            try:
+                translator.load_model()
+                translator.start()  # does nothing if captioning stopped meanwhile
+            except TranslationError as exc:
+                GLib.idle_add(self._translation_failed, session, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                GLib.idle_add(
+                    self._translation_failed, session, f"Failed to start translation: {exc}"
+                )
+
+        threading.Thread(target=_boot, name="translation-boot", daemon=True).start()
+
+    def _stop_translation(self) -> None:
+        if self._flush_timer is not None:
+            GLib.source_remove(self._flush_timer)
+            self._flush_timer = None
+        if self.translator:
+            # Joining an in-flight translation can take a moment: do it off the UI
+            # thread. The session number already discards its results.
+            translator, self.translator = self.translator, None
+            threading.Thread(target=translator.stop, name="translation-stop", daemon=True).start()
 
     def _abort_boot(
         self, session: int, capture: AudioCapture, stt: SpeechToText, message: str
@@ -449,12 +787,26 @@ class CaptionEnglishApp(Gtk.Application):
             except Exception:  # noqa: BLE001
                 logger.exception("Error stopping STT")
             self.stt = None
+        self._stop_translation()
+        # An unfinished sentence stays on its own, apart from the next session
+        self.history.end_session()
         if self.control:
             self.control.set_running(False)
             self.control.set_status("Stopped")
 
     def _show_text(self, session: int, text: str, is_final: bool) -> bool:
         if session != self._session:
+            return False
+        if is_final:
+            # Every final English phrase, in both modes; Korean never comes through here
+            self.history.add_final(text)
+            self._refresh_history()
+        if self._bilingual is not None:
+            if is_final:
+                self._bilingual.add_final(text)
+            else:
+                self._bilingual.set_partial(text)
+            self._render_bilingual()
             return False
         if is_final:
             self._finals.append(text)
@@ -468,6 +820,48 @@ class CaptionEnglishApp(Gtk.Application):
             self._partial = text
         if self.overlay:
             self.overlay.set_caption_text(format_captions([*self._finals, self._partial]))
+        return False
+
+    def _render_bilingual(self) -> None:
+        assert self._bilingual is not None
+        # Keep enough two-language history to fill the overlay; older blocks scroll away
+        self._bilingual.trim(
+            self.config.overlay_width, self.config.overlay_height, self.config.font_size
+        )
+        if self.overlay:
+            self.overlay.set_caption_markup(self._bilingual.markup(GLib.markup_escape_text))
+
+    def _show_translation(self, session: int, block_id: int, korean: str) -> bool:
+        if session != self._session or self._bilingual is None:
+            return False
+        if self._bilingual.set_translation(block_id, korean):
+            self._render_bilingual()
+        return False
+
+    def _flush_tick(self, session: int) -> bool:
+        if session != self._session or self._bilingual is None:
+            return False
+        if self._bilingual.flush_due():
+            self._render_bilingual()
+        return True
+
+    def _on_translation_status(self, session: int, message: str) -> None:
+        if self.control and session == self._session:
+            self.control.set_translation_status(message)
+
+    def _translation_failed(self, session: int, message: str) -> bool:
+        """Show the error and keep English captioning; Korean stays off this session."""
+        if session != self._session:
+            return False
+        logger.error(message)
+        if self.translator:
+            # The worker has already ended; stopping it only releases the queue
+            translator, self.translator = self.translator, None
+            threading.Thread(target=translator.stop, name="translation-stop", daemon=True).start()
+        if self._bilingual is not None:
+            self._bilingual.stop_translating()
+        if self.control:
+            self.control.set_translation_status(f"Error: {message}", error=True)
         return False
 
     def _on_status(self, session: int, message: str) -> None:
