@@ -137,7 +137,25 @@ Times are approximate. They show when a sentence's first words became final text
 
 Saving and clearing need GTK 4.10 or newer (Ubuntu 23.04 and later). On older GTK the history box says so, and the rest of the app works as before.
 
-## Desktop launcher
+## Install as an app
+
+To install Caption English for your user like a regular app, with an Applications-menu entry and no need to keep this folder around afterwards:
+
+```bash
+./scripts/install.sh
+```
+
+This needs the system packages from **Requirements**; the script tells you which `sudo apt install` to run if any are missing. It does not need sudo itself. It installs:
+
+- `~/.local/share/caption-english/`: the app with its own Python environment (about 420 MB)
+- `~/.local/bin/caption-english`: a command that starts it
+- `~/.local/share/applications/caption-english.desktop`: the **Caption English** entry in the Applications menu
+
+Run the script again from an updated checkout to upgrade. To remove the app, run `./scripts/uninstall.sh`. Your settings (`~/.config/caption-english/`) and downloaded models (`~/.cache/huggingface/`) are kept.
+
+## Desktop launcher (development)
+
+For working on the code, this adds a menu entry that runs this checkout directly instead. It uses the same menu entry file as **Install as an app**, so it replaces that entry; run `./scripts/install.sh` again to switch back.
 
 ```bash
 ./scripts/install-desktop.sh
