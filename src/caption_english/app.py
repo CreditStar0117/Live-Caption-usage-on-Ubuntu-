@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import threading
+from datetime import datetime
 from typing import Any
 
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk  # noqa: E402
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
 
 from caption_english.audio import AudioCapture, CaptureError, CaptureSource
 from caption_english import translate
@@ -34,6 +36,12 @@ from caption_english.config import (
     model_choices,
     save_config,
 )
+from caption_english.history import (
+    CaptionHistory,
+    default_filename,
+    history_summary,
+    write_transcript,
+)
 from caption_english.overlay import CaptionOverlay
 from caption_english.stt import SpeechEngineError, SpeechToText, preload_model
 from caption_english.translate import TranslationError, Translator
@@ -44,6 +52,27 @@ logger = logging.getLogger(__name__)
 FLUSH_CHECK_MS = 250
 TRANSLATION_OFF = "Off. English captions only."
 TRANSLATION_NEXT_START = "Korean appears under each English sentence from the next Start."
+# The save and confirm dialogs need GTK 4.10 (Ubuntu 22.04 ships 4.6)
+HAS_DIALOGS = hasattr(Gtk, "FileDialog") and hasattr(Gtk, "AlertDialog")
+HISTORY_NEEDS_GTK = "Saving history needs GTK 4.10 or newer."
+
+
+def _sentences(count: int) -> str:
+    return f"{count} sentence" if count == 1 else f"{count} sentences"
+
+
+def _documents_folder() -> str:
+    documents = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+    if documents and os.path.isdir(documents):
+        return documents
+    return GLib.get_home_dir()
+
+
+def _dialog_dismissed(exc: GLib.Error) -> bool:
+    quark = Gtk.dialog_error_quark()
+    return exc.matches(quark, Gtk.DialogError.DISMISSED) or exc.matches(
+        quark, Gtk.DialogError.CANCELLED
+    )
 
 
 class ControlWindow(Gtk.ApplicationWindow):
@@ -199,6 +228,41 @@ class ControlWindow(Gtk.ApplicationWindow):
         tr_box.append(self.translation_status)
         root.append(tr_frame)
 
+        # English caption history for this app run
+        hist_frame = Gtk.Frame(label="Caption history")
+        hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hist_box.set_margin_top(8)
+        hist_box.set_margin_bottom(8)
+        hist_box.set_margin_start(8)
+        hist_box.set_margin_end(8)
+        hist_frame.set_child(hist_box)
+
+        hist_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.history_summary = Gtk.Label(
+            label=history_summary(0, None), xalign=0.0, wrap=True
+        )
+        self.history_summary.set_hexpand(True)
+        hist_row.append(self.history_summary)
+        self.save_history_btn = Gtk.Button(label="Save history…")
+        self.save_history_btn.set_sensitive(False)
+        self.save_history_btn.connect("clicked", lambda *_: app.save_history())
+        hist_row.append(self.save_history_btn)
+        self.clear_history_btn = Gtk.Button(label="Clear…")
+        self.clear_history_btn.set_sensitive(False)
+        self.clear_history_btn.connect("clicked", lambda *_: app.clear_history())
+        hist_row.append(self.clear_history_btn)
+        hist_box.append(hist_row)
+
+        self.history_error = Gtk.Label(xalign=0.0, wrap=True)
+        if HAS_DIALOGS:
+            self.history_error.add_css_class("error")
+            self.history_error.set_visible(False)
+        else:
+            self.history_error.set_text(HISTORY_NEEDS_GTK)
+            self.history_error.add_css_class("dim-label")
+        hist_box.append(self.history_error)
+        root.append(hist_frame)
+
         # Actions
         actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.start_btn = Gtk.Button(label="Start")
@@ -301,6 +365,19 @@ class ControlWindow(Gtk.ApplicationWindow):
 
         GLib.idle_add(_set)
 
+    def update_history(self, count: int, saved_name: str | None) -> None:
+        """Show the history size; call on the GTK thread."""
+        self.history_summary.set_text(history_summary(count, saved_name))
+        self.save_history_btn.set_sensitive(HAS_DIALOGS and count > 0)
+        self.clear_history_btn.set_sensitive(HAS_DIALOGS and count > 0)
+
+    def set_history_error(self, text: str) -> None:
+        """Show a save error in red, or hide it with an empty text; call on the GTK thread."""
+        if not HAS_DIALOGS:
+            return
+        self.history_error.set_text(text)
+        self.history_error.set_visible(bool(text))
+
     def set_overlay_button_label(self, visible: bool) -> None:
         def _set() -> bool:
             self.toggle_overlay_btn.set_label("Hide overlay" if visible else "Show overlay")
@@ -327,6 +404,12 @@ class CaptionEnglishApp(Gtk.Application):
         self.translator: Translator | None = None
         self._bilingual: BilingualCaptions | None = None
         self._flush_timer: int | None = None
+        # Final English for the whole app run, saved only when the user asks
+        self.history = CaptionHistory()
+        self._history_folder: str | None = None
+        self._history_saved_name: str | None = None
+        # Set while the "save before quitting?" prompt or its save dialog is open
+        self._closing_prompt = False
 
     def do_activate(self) -> None:  # noqa: N802
         if self.control is None:
@@ -365,10 +448,139 @@ class CaptionEnglishApp(Gtk.Application):
         ).start()
 
     def _on_control_close(self, *_args) -> bool:  # noqa: ANN001
+        if HAS_DIALOGS and self.history.has_unsaved:
+            # Keep the window (and captioning) until the user decides
+            if not self._closing_prompt:
+                self._closing_prompt = True
+                self._ask_before_quit()
+            return True
+        self._quit()
+        return False
+
+    def _quit(self) -> None:
         self.stop_captioning()
         self._persist_config()
         self.quit()
-        return False
+
+    def _ask_before_quit(self) -> None:
+        count = self.history.sentence_count
+        dialog = Gtk.AlertDialog(
+            message="Save caption history before quitting?",
+            detail=f"{_sentences(count)} of English captions have not been saved. "
+            "They are lost if you quit without saving.",
+            buttons=["Cancel", "Discard", "Save…"],
+            cancel_button=0,
+            default_button=2,
+            modal=True,
+        )
+        dialog.choose(self.control, None, self._on_quit_chosen)
+
+    def _on_quit_chosen(self, dialog: Gtk.AlertDialog, result: Gio.AsyncResult) -> None:
+        try:
+            choice = dialog.choose_finish(result)
+        except GLib.Error:
+            choice = 0
+        if choice == 2:
+            self.save_history(quit_after=True)
+        elif choice == 1:
+            self._quit()
+        else:
+            self._closing_prompt = False
+
+    def _refresh_history(self) -> None:
+        if self.control:
+            saved = None if self.history.has_unsaved else self._history_saved_name
+            self.control.update_history(self.history.sentence_count, saved)
+
+    def save_history(self, quit_after: bool = False) -> None:
+        """Ask where to save the English caption history, then write it there."""
+        if not HAS_DIALOGS or self.control is None:
+            return
+        dialog = Gtk.FileDialog(title="Save caption history", modal=True)
+        dialog.set_initial_name(default_filename(datetime.now()))
+        dialog.set_initial_folder(
+            Gio.File.new_for_path(self._history_folder or _documents_folder())
+        )
+        text_files = Gtk.FileFilter(name="Text files (*.txt)")
+        text_files.add_suffix("txt")
+        all_files = Gtk.FileFilter(name="All files")
+        all_files.add_pattern("*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(text_files)
+        filters.append(all_files)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(text_files)
+        dialog.save(self.control, None, self._on_save_chosen, quit_after)
+
+    def _on_save_chosen(
+        self, dialog: Gtk.FileDialog, result: Gio.AsyncResult, quit_after: bool
+    ) -> None:
+        try:
+            gfile = dialog.save_finish(result)
+        except GLib.Error as exc:
+            if not _dialog_dismissed(exc):
+                self._history_save_failed(f"Could not save history: {exc.message}")
+            self._closing_prompt = False
+            return
+        path = gfile.get_path() if gfile else None
+        if not path:
+            self._history_save_failed("Could not save history: choose a folder on this computer.")
+            return
+        # Written synchronously, so nothing is recorded between these two lines
+        revision = self.history.revision
+        try:
+            write_transcript(path, self.history.transcript(datetime.now()))
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            self._history_save_failed(f"Could not save {os.path.basename(path)}: {reason}")
+            return
+        self.history.mark_saved(revision)
+        self._history_folder = os.path.dirname(path)
+        self._history_saved_name = os.path.basename(path)
+        logger.info("Saved caption history to %s", path)
+        if self.control:
+            self.control.set_history_error("")
+        self._refresh_history()
+        if quit_after:
+            self._quit()
+
+    def _history_save_failed(self, message: str) -> None:
+        logger.error(message)
+        # A failed save while quitting keeps the app open
+        self._closing_prompt = False
+        if self.control:
+            self.control.set_history_error(message)
+
+    def clear_history(self) -> None:
+        """Empty the caption history once the user confirms."""
+        count = self.history.sentence_count
+        if not HAS_DIALOGS or self.control is None or count == 0:
+            return
+        detail = f"{_sentences(count)} will be removed."
+        if self.history.has_unsaved:
+            detail += " They have not been saved." if count > 1 else " It has not been saved."
+        dialog = Gtk.AlertDialog(
+            message="Clear caption history?",
+            detail=detail,
+            buttons=["Cancel", "Clear"],
+            cancel_button=0,
+            default_button=0,
+            modal=True,
+        )
+        dialog.choose(self.control, None, self._on_clear_chosen)
+
+    def _on_clear_chosen(self, dialog: Gtk.AlertDialog, result: Gio.AsyncResult) -> None:
+        try:
+            choice = dialog.choose_finish(result)
+        except GLib.Error:
+            return
+        if choice != 1:
+            return
+        self.history.clear()
+        self._history_saved_name = None
+        if self.control:
+            self.control.set_history_error("")
+        self._refresh_history()
 
     def _on_overlay_close(self, *_args) -> bool:  # noqa: ANN001
         # Hide instead of destroy so show/hide still works
@@ -467,6 +679,7 @@ class CaptionEnglishApp(Gtk.Application):
         self._finals = []
         self._partial = ""
         self._bilingual = None
+        self.history.start_session(source.value)
         if self.overlay:
             self.overlay.set_caption_text("")
         if self.control:
@@ -575,6 +788,8 @@ class CaptionEnglishApp(Gtk.Application):
                 logger.exception("Error stopping STT")
             self.stt = None
         self._stop_translation()
+        # An unfinished sentence stays on its own, apart from the next session
+        self.history.end_session()
         if self.control:
             self.control.set_running(False)
             self.control.set_status("Stopped")
@@ -582,6 +797,10 @@ class CaptionEnglishApp(Gtk.Application):
     def _show_text(self, session: int, text: str, is_final: bool) -> bool:
         if session != self._session:
             return False
+        if is_final:
+            # Every final English phrase, in both modes; Korean never comes through here
+            self.history.add_final(text)
+            self._refresh_history()
         if self._bilingual is not None:
             if is_final:
                 self._bilingual.add_final(text)
