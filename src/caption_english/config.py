@@ -1,4 +1,4 @@
-"""XDG config for overlay size, caption text, audio source and model preferences."""
+"""XDG config for overlay size, caption text, audio source, model and translation preferences."""
 
 from __future__ import annotations
 
@@ -53,6 +53,11 @@ def _parse_font_size(value: object) -> int:
         return DEFAULT_FONT_SIZE
 
 
+def _parse_bool(value: object, default: bool) -> bool:
+    # Only real JSON booleans count, so a hand-edited "yes" does not turn a feature on
+    return value if isinstance(value, bool) else default
+
+
 def config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
@@ -75,6 +80,7 @@ class AppConfig:
     model_size: str = DEFAULT_MODEL
     overlay_visible: bool = True
     font_size: int = DEFAULT_FONT_SIZE
+    translate_korean: bool = False
 
     def clamped(self) -> AppConfig:
         w, h = clamp_size(self.overlay_width, self.overlay_height)
@@ -87,6 +93,7 @@ class AppConfig:
             model_size=self.model_size or DEFAULT_MODEL,
             overlay_visible=bool(self.overlay_visible),
             font_size=clamp_font_size(self.font_size),
+            translate_korean=self.translate_korean is True,
         )
 
 
@@ -105,6 +112,7 @@ def load_config() -> AppConfig:
             model_size=data.get("model_size", DEFAULT_MODEL),
             overlay_visible=bool(data.get("overlay_visible", True)),
             font_size=_parse_font_size(data.get("font_size", DEFAULT_FONT_SIZE)),
+            translate_korean=_parse_bool(data.get("translate_korean"), False),
         )
         return cfg.clamped()
     except (OSError, ValueError, TypeError, json.JSONDecodeError):

@@ -1,6 +1,6 @@
 # Caption English
 
-Live English captions for Ubuntu. Captures microphone or system audio, transcribes locally with Whisper, and shows text in an always-on-top overlay whose **width** and **height** you control.
+Live English captions for Ubuntu. Captures microphone or system audio, transcribes locally with Whisper, and shows text in an always-on-top overlay whose **width** and **height** you control. Optionally translates the captions into **Korean**, also on your own computer.
 
 ## Requirements (Ubuntu)
 
@@ -10,12 +10,13 @@ sudo apt install -y \
   python3 python3-venv python3-pip python3-gi \
   gir1.2-gtk-4.0 \
   pipewire-pulse pulseaudio-utils \
-  libportaudio2
+  libportaudio2 fonts-noto-cjk
 ```
 
 - **PipeWire/PulseAudio** must be running (default on modern Ubuntu).
 - System-audio captions record the default output’s **monitor** source with `parec` (from `pulseaudio-utils`). The microphone is read through PortAudio (`libportaudio2`).
 - First run downloads a local Whisper model (`base.en`, ~150 MB). The optional Fast model, `tiny.en` (~75 MB), downloads the first time you use it. Audio and text stay on your machine.
+- `fonts-noto-cjk` provides the Korean (Hangul) font for translated captions. Ubuntu desktop installs it by default.
 
 ## Install
 
@@ -86,6 +87,28 @@ The overlay asks the window manager to keep it above other windows. On a GNOME *
 
 Choose **system**, **mic**, or **both** in the control window before starting.
 
+### Korean translation
+
+Turn on **Korean translation** in the control window's **Translation** box, then press **Start**. The switch is locked while captioning and is saved for the next launch. It is off by default.
+
+- The overlay shows each block of English captions with its Korean translation directly underneath, in amber. English that is still in progress, or a sentence that is not finished yet, shows in English only until its sentence is complete.
+- Korean is translated a whole sentence at a time, so it does not keep changing. It usually appears a second or two after the sentence ends. A sentence the speaker leaves unfinished is translated anyway after about 2 seconds of quiet, or after 8 seconds during non-stop speech.
+- English captions are never slowed down by translation, including while the translation model downloads or loads.
+- The first start with translation on downloads the translation model (~620 MB) to `~/.cache/huggingface/`. The **Translation** box shows the download status, and English captions run meanwhile. After that, translation works offline. Caption text is never sent anywhere.
+- If the translation model cannot be downloaded, loaded or run, the **Translation** box shows the error in red. English captioning continues, and translation stays off until you press **Stop** and **Start** again.
+- Translation adds about 1 GB of memory use while it is on.
+
+The translation model is [NLLB-200 distilled 600M](https://huggingface.co/facebook/nllb-200-distilled-600M) by Meta, converted for CTranslate2 (`JustFrederik/nllb-200-distilled-600M-ct2-int8`, pinned to one revision). **Its license is CC-BY-NC 4.0: non-commercial use only.**
+
+To use a model you converted yourself, for example when offline or if the pinned repository goes away, point `CAPTION_ENGLISH_TRANSLATION_MODEL` at its directory:
+
+```bash
+pip install transformers torch sentencepiece   # only needed for the conversion
+ct2-transformers-converter --model facebook/nllb-200-distilled-600M \
+  --quantization int8 --copy_files tokenizer.json --output_dir ~/nllb-600m-ct2
+CAPTION_ENGLISH_TRANSLATION_MODEL=~/nllb-600m-ct2 ./scripts/run.sh
+```
+
 ## Desktop launcher
 
 ```bash
@@ -119,6 +142,14 @@ python -m unittest discover -s tests -v
 
 On an 8-core desktop CPU with `base.en`, expect a median of about 0.8 s to first appearance and about 4 s to final text during continuous speech.
 
+Add `--translate` to also run the Korean translation path the app uses. It reports how long after a sentence completes its Korean arrives, the translation time per block, and the last few English/Korean pairs (`--beam 1` tries the faster, less accurate beam size):
+
+```bash
+.venv/bin/python scripts/bench_latency.py talk.mp3 --translate
+```
+
+With translation on, English captions keep the same latency, and Korean typically arrives about 0.5 s after each sentence completes.
+
 ## Privacy
 
-Transcription runs locally via `faster-whisper`. No audio is uploaded by this app.
+Transcription runs locally via `faster-whisper`, and Korean translation runs locally via CTranslate2. No audio or caption text is uploaded by this app. The network is used only to download models the first time they are needed.
